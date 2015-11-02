@@ -1,0 +1,9 @@
+[package]
+name = "crust-experiment"
+version = "0.1.0"
+authors = ["Andrew Cann <shum@canndrew.org>"]
+
+[dependencies]
+mio = "*"
+crossbeam = "*"
+
