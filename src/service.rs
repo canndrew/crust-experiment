@@ -8,13 +8,18 @@ use pipe;
 
 use address::{ListenAddr, ToListenAddr, PeerAddr};
 
+/// Our handle to the crust library. All actions are performed either directly or indirectly
+/// through a `Service` and the library is guaranteed to have cleaned up all resources on
+/// destruction of a `Service`.
 pub struct Service;
 
 impl Service {
+    /// Create a new `Service`.
     pub fn new() -> Service {
         Service
     }
 
+    /// Create an `Acceptor` from this `Service`.
     pub fn acceptor<'s>(&'s self) -> io::Result<Acceptor<'s>> {
         Ok(Acceptor {
             service: PhantomData,
@@ -35,6 +40,7 @@ struct ListenSet {
     listeners: Vec<mio::tcp::TcpListener>,
 }
 
+/// Used to listen for and accept incoming connections.
 pub struct Acceptor<'s> {
     service: PhantomData<&'s Service>,
     listen_set: ::std::sync::Mutex<ListenSet>,
@@ -43,6 +49,9 @@ pub struct Acceptor<'s> {
 }
 
 impl<'s> Acceptor<'s> {
+    /// Start listening. This creates an `AcceptorReactor` that can be used to block, wait for and
+    /// process incoming connections and an `AcceptorController` that can be used to control the
+    /// `Acceptor`.
     pub fn start<'a>(&'a mut self) -> io::Result<(AcceptorReactor<'a, 's>, AcceptorController<'a, 's>)> {
         let (pr, pw) = try!(pipe::pipe());
         let mut guard = self.listen_set.lock().unwrap();
@@ -59,12 +68,20 @@ impl<'s> Acceptor<'s> {
     }
 }
 
+/// Used to accept incoming connections on an `Acceptor`.
 pub struct AcceptorReactor<'a, 's: 'a> {
     acceptor: &'a Acceptor<'s>,
     notify_pipe: pipe::Reader,
 }
 
 impl<'a, 's: 'a> AcceptorReactor<'a, 's> {
+    /// Block until either we recieve an incoming connection or the `Acceptor` shuts down due to
+    /// the corresponding `AcceptorController` being dropped.
+    /// 
+    /// # Returns
+    ///
+    /// `None` if the `Acceptor` has shutdown. Otherwise returns itself along with the new
+    /// connection (or an error if there was an error accepting the connection).
     pub fn accept(mut self) -> Option<(AcceptorReactor<'a, 's>, io::Result<Connection<'s>>)> {
         let mut guard = self.acceptor.listen_set.lock().unwrap();
         loop {
@@ -103,6 +120,7 @@ impl<'a, 's: 'a> AcceptorReactor<'a, 's> {
     }
 }
 
+/// Used for iterating over the incoming connections of an `AcceptorReactor`.
 pub struct AcceptIter<'a, 's: 'a> {
     acceptor_reactor: Option<AcceptorReactor<'a, 's>>,
 }
@@ -130,14 +148,19 @@ impl<'a, 's: 'a> Iterator for AcceptIter<'a, 's> {
     }
 }
 
+/// Used to control an `Acceptor` that has been started. On dropping this object the `Acceptor`
+/// will stop and any corresponding `AcceptorReactor::accept` call will unblock and return `None`.
 pub struct AcceptorController<'a, 's: 'a> {
     acceptor: &'a Acceptor<'s>,
     notify_pipe: ::std::sync::Mutex<pipe::Writer>,
 }
 
+/// Errors returned by `AcceptorController::add_listener`
 #[derive(Debug)]
 pub enum AddListenerError<E> {
+    /// The argument could not parsed as a valid address.
     ParseError(E),
+    /// An IO error occured while creating the listener.
     IoError(io::Error),
 }
 
@@ -148,6 +171,7 @@ impl<E> From<io::Error> for AddListenerError<E> {
 }
 
 impl<'a, 's: 'a> AcceptorController<'a, 's> {
+    /// Add an address to the `Acceptor` to listen for incoming connections on.
     pub fn add_listener<A: ToListenAddr>(&self, addr: A) -> Result<(), AddListenerError<A::Err>> {
         let addr = match addr.to_listen_addr() {
             Ok(addr) => addr,
@@ -190,6 +214,12 @@ impl<'a, 's: 'a> AcceptorController<'a, 's> {
         Ok(())
     }
 
+    /// Create a pair of objects that can be used to monitor the acceptor for listening addresses
+    /// being added or removed. This allows you to keep track of what addresses the `Acceptor` is
+    /// listening on. This is necessary because new addresses may be added asynchronously due to
+    /// bootstrapping or the `Acceptor` detecting peers on the local network. Addresses may also be
+    /// dropped when the `Acceptor` loses the ability to listen on one (such as when a network
+    /// interface is unplugged).
     pub fn listener_events<'c>(&'c self) -> (ListenerEventsReactor<'c, 'a, 's>, ListenerEventsController<'c, 'a, 's>) {
         let (event_sender, event_receiver) = channel();
         {
@@ -215,16 +245,24 @@ impl<'a, 's: 'a> Drop for AcceptorController<'a, 's> {
     }
 }
 
+/// Issued when the state of an `Acceptor` has changed. See `AcceptorController::listener_events`
+/// and the `ListenerEventsReactor` type for more details.
 pub enum ListenerEvent {
+    /// The `Acceptor` has started listening on an address.
     StartListening(PeerAddr),
 }
 
+/// Created via the `AcceptorController::listener_events` function. Used to react to changes in the
+/// listener set of an `Acceptor`. Whenever an `Acceptor` starts or stops listening on an address
+/// it issues a `ListenerEvent` to all `ListenerEventReactors`.
 pub struct ListenerEventsReactor<'c, 'a: 'c, 's: 'a> {
     controller: PhantomData<&'c AcceptorController<'a, 's>>,
     event_receiver: Receiver<Option<ListenerEvent>>,
 }
 
 impl<'c, 'a: 'c, 's: 'a> ListenerEventsReactor<'c, 'a, 's> {
+    /// Blocks until either the `Acceptor` issues a `ListenerEvent` or the
+    /// `ListenerEventController` that `self` was created with is dropped.
     pub fn next_event(self) -> Option<(ListenerEventsReactor<'c, 'a, 's>, ListenerEvent)> {
         self.event_receiver.recv().unwrap().map(|e| (self, e))
     }
@@ -240,6 +278,7 @@ impl<'c, 'a: 'c, 's: 'a> IntoIterator for ListenerEventsReactor<'c, 'a, 's> {
     }
 }
 
+/// Used to iterate over all `ListenerEvent`s from a `ListenerEventsReactor`.
 pub struct ListenerEventsIter<'c, 'a: 'c, 's: 'a> {
     listener_events_reactor: Option<ListenerEventsReactor<'c, 'a, 's>>,
 }
@@ -256,6 +295,8 @@ impl<'c, 'a: 'c, 's: 'a> Iterator for ListenerEventsIter<'c, 'a, 's> {
     }
 }
 
+/// Created via the `AcceptorController::listener_events` function, this object can be dropped in
+/// order to unblock the corresponding `ListenerEventsReactor`.
 pub struct ListenerEventsController<'c, 'a: 'c, 's: 'a> {
     controller: PhantomData<&'c AcceptorController<'a, 's>>,
     event_sender: Sender<Option<ListenerEvent>>,
